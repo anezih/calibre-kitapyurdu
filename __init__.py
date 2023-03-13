@@ -24,7 +24,7 @@ lang_to_eng = {
 
 class KitapyurduMetadata():
     title: str = None
-    author: str = None
+    author: list[str] = None
     editor: str = None
     translator: str = None
     publisher: str = None
@@ -42,7 +42,21 @@ class KitapyurduMetadata():
     cover_id: str = None
     source_relevance: int = None
 
-    def to_calibre_metadata(self):
+    def extra_metadata(self):
+        res = f""
+        if self.editor:
+            res += f"Editör(ler): {self.editor}<br/>"
+        if self.translator:
+            res += f"Çevirmen(ler): {self.translator}<br/>"
+        if self.original_name:
+            res += f"Orijinal Adı: {self.original_name}<br/>"
+        if self.pages_num:
+            res += f"Sayfa Sayısı: {self.pages_num}"
+        if res:
+            res = f"<p>{res}</p>"
+        return res
+
+    def to_calibre_metadata(self, append_extra: bool = False):
         mi = Metadata(
             title=self.title,
             authors=self.author
@@ -66,16 +80,20 @@ class KitapyurduMetadata():
         if self.date:
             mi.pubdate = self.date
         if self.desc:
-            mi.comments = self.desc
+            mi.comments = f"{self.desc}{self.extra_metadata() if append_extra else ''}"
         mi.source_relevance = self.source_relevance
         return mi
 
 class KitapyurduMetadataParser(): 
-    def __init__(self, query, limit, logger) -> None:
+    def __init__(self, query, limit, logger, identifers: dict = {}) -> None:
         self.query = query
         self.max_results = limit
         self.logger = logger
         self.br = mechanize.Browser()
+        self.ky_ident = None
+        ky_ident = identifers.get("kitapyurdu")
+        if ky_ident:
+            self.ky_ident = ky_ident
 
     def url_content_from_query(self, query, limit):
         quoted = quote_plus(query)
@@ -120,8 +138,12 @@ class KitapyurduMetadataParser():
         else:
             return []
 
-    def parse_pages(self):
-        soups = [(BeautifulSoup(self.url_content(u), "lxml"), u) for u in self.get_search_page_urls(q=self.query, lim=self.max_results) if u]
+    def parse_pages(self, only_ident: bool = False):
+        if only_ident:
+            u = f"https://www.kitapyurdu.com/kitap/-/{self.ky_ident}.html"
+            soups = [(BeautifulSoup(self.url_content(u), "lxml"), u)]
+        else:
+            soups = [(BeautifulSoup(self.url_content(u), "lxml"), u) for u in self.get_search_page_urls(q=self.query, lim=self.max_results) if u]
         metadata_list = []
         if not soups:
             return metadata_list
@@ -139,7 +161,7 @@ class KitapyurduMetadataParser():
 
             author = soup[0].select("div.pr_producers__manufacturer > div.pr_producers__item")
             if author:
-                metadata.author = [a.getText().strip() for a in author]
+                metadata.author = [a.getText().replace(",","").strip() for a in author]
 
             publisher = soup[0].select_one("div.pr_producers__publisher")
             if publisher:
@@ -224,12 +246,14 @@ class KitapyurduMetadataParser():
         return metadata_list
 
 class Kitapyurdu(Source):
-    name                = "Kitapyurdu"
-    author              = "Nezih <https://github.com/anezih>"
-    description         = _("Downloads metadata and covers from kitapyurdu.com")
-    supported_platforms = ["windows", "osx", "linux"]
-    capabilities        = frozenset(["identify", "cover"])
-    touched_fields      = frozenset(
+    name                    = "Kitapyurdu"
+    author                  = "Nezih <https://github.com/anezih>"
+    description             = _("Downloads metadata and covers from kitapyurdu.com")
+    version                 = (1, 1, 0)
+    minimum_calibre_version = (6, 10, 0)
+    supported_platforms     = ["windows", "osx", "linux"]
+    capabilities            = frozenset(["identify", "cover"])
+    touched_fields          = frozenset(
         [
             "title", "authors", "tags", "publisher", "comments", "pubdate",
             "rating", "identifier:isbn", "language", "identifier:kitapyurdu"
@@ -244,6 +268,7 @@ class Kitapyurdu(Source):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.max_res = self.prefs.get("entries_per_search_result_page")
+        self.append_extra = self.prefs.get("append_extra_metadata_to_desc")
 
     options = (
         Option (
@@ -253,6 +278,13 @@ class Kitapyurdu(Source):
             _("Max. number of search results."),
             _("Select max. number of search results. (50 may cause timeout errors.)"),
             {20:"20", 25:"25", 50:"50"}
+        ),
+        Option (
+            "append_extra_metadata_to_desc",
+            "bool",
+            False,
+            _("Append extra metadata to the end of the description."),
+            _("Extra metadata: Editor(s), translator(s), original name, page number.")
         ),
     )
 
@@ -285,30 +317,40 @@ class Kitapyurdu(Source):
             else:
                 return None
     
-    def create_metadata_list(self, log, title=None, authors=None):
+    def create_metadata_list(self, log, title=None, authors=None, identifiers={}):
+        metadata_list: list[KitapyurduMetadata] = []
+        ky_ident = identifiers.get("kitapyurdu")
+        if ky_ident:
+            ky_metadata_obj = KitapyurduMetadataParser(query=None, identifers=identifiers, limit=self.max_res, logger=log)
+            metadata_list = ky_metadata_obj.parse_pages(only_ident=True)
+            if metadata_list:
+                log.info(f"{'-'*30}\nMatched kitapyurdu id.")
+                return metadata_list
         title_authors = self.build_query(log=log, title=title, authors=authors)
         ky_metadata_obj = KitapyurduMetadataParser(query=title_authors, limit=self.max_res, logger=log)
-        metadata_list: list[KitapyurduMetadata] = ky_metadata_obj.parse_pages()
+        metadata_list = ky_metadata_obj.parse_pages()
         if metadata_list:
             return metadata_list
         else:
             log.info(f"Build query second pass: only_title, strip_subtitle, rm_accents")
             title_authors = self.build_query(log=log, title=title, authors=authors, only_title=True, rm_accents=True, ss=True)
             ky_metadata_obj = KitapyurduMetadataParser(query=title_authors, limit=self.max_res, logger=log)
-            metadata_list: list[KitapyurduMetadata] = ky_metadata_obj.parse_pages()
+            metadata_list = ky_metadata_obj.parse_pages()
             if metadata_list:
                 return metadata_list
             else:
                 return None
   
     def identify(self, log, result_queue, abort, title=None, authors=None, identifiers={}, timeout=30):
-        metadata_list = self.create_metadata_list(log=log, title=title, authors=authors)
+        if abort.is_set():
+            return
+        metadata_list = self.create_metadata_list(log=log, title=title, authors=authors, identifiers=identifiers)
         if not metadata_list:
             return
         if metadata_list:
             for relevance, mi in enumerate(metadata_list, start=1):
                 mi.source_relevance = relevance
-                result_queue.put(mi.to_calibre_metadata())
+                result_queue.put(mi.to_calibre_metadata(self.append_extra))
         
     def get_cached_cover_url(self, identifiers):
         _id = identifiers.get('kitapyurdu_kapak')
