@@ -84,12 +84,16 @@ class KitapyurduMetadata():
         mi.source_relevance = self.source_relevance
         return mi
 
-class KitapyurduMetadataParser(): 
+class KitapyurduMetadataParser():
     def __init__(self, query, limit, logger, identifers: dict = {}) -> None:
         self.query = query
         self.max_results = limit
         self.logger = logger
         self.br = mechanize.Browser()
+        self.br.set_handle_robots(False)
+        self.br.addheaders = [
+            ('User-Agent', 'APIs-Google (+https://developers.google.com/webmasters/APIs-Google.html)'),
+        ]
         self.ky_ident = None
         ky_ident = identifers.get("kitapyurdu")
         if ky_ident:
@@ -183,7 +187,7 @@ class KitapyurduMetadataParser():
                     jbox = cover_url_with_res.select_one("a.js-jbox-book-cover")["href"]
                     cover_url = jbox[:jbox.index("wh") - 1]
                     metadata.cover_url = [cover_url]
-            
+
             if metadata.cover_url:
                 metadata.cover_id = metadata.cover_url[0].split(":")[-1]
 
@@ -222,7 +226,7 @@ class KitapyurduMetadataParser():
             isbn = attrs_table.get("ISBN:")
             if isbn:
                 metadata.isbn = isbn
-            
+
             lang = attrs_table.get("Dil:")
             if lang:
                 # lang = lang.replace("I","ı").replace("İ", "i")
@@ -249,7 +253,7 @@ class Kitapyurdu(Source):
     name                    = "Kitapyurdu"
     author                  = "Nezih <https://github.com/anezih>"
     description             = _("Downloads metadata and covers from kitapyurdu.com")
-    version                 = (1, 1, 0)
+    version                 = (1, 1, 1)
     minimum_calibre_version = (6, 10, 0)
     supported_platforms     = ["windows", "osx", "linux"]
     capabilities            = frozenset(["identify", "cover"])
@@ -290,7 +294,7 @@ class Kitapyurdu(Source):
 
     def get_book_url_name(self, idtype, idval, url):
         return "Kitapyurdu"
-    
+
     def get_book_url(self, identifiers):
         kitapyurdu_id = identifiers.get("kitapyurdu")
         if kitapyurdu_id:
@@ -316,7 +320,7 @@ class Kitapyurdu(Source):
                 return all
             else:
                 return None
-    
+
     def create_metadata_list(self, log, title=None, authors=None, identifiers={}):
         metadata_list: list[KitapyurduMetadata] = []
         ky_ident = identifiers.get("kitapyurdu")
@@ -340,7 +344,7 @@ class Kitapyurdu(Source):
                 return metadata_list
             else:
                 return None
-  
+
     def identify(self, log, result_queue, abort, title=None, authors=None, identifiers={}, timeout=30):
         if abort.is_set():
             return
@@ -351,7 +355,7 @@ class Kitapyurdu(Source):
             for relevance, mi in enumerate(metadata_list, start=1):
                 mi.source_relevance = relevance
                 result_queue.put(mi.to_calibre_metadata(self.append_extra))
-        
+
     def get_cached_cover_url(self, identifiers):
         _id = identifiers.get('kitapyurdu_kapak')
         if _id:

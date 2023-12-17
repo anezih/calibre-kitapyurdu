@@ -12,6 +12,8 @@ This plugin tries to parse metadata and cover information from kitapyurdu.com, a
 
 <details>
 <summary><b>Changelog:</b></summary>
+<b>Ver. 1.1.1</b>
+<li>Bugfix.</li>
 <b>Ver. 1.1.0</b>
 <li>Set minimum Calibre version.</li>
 <li>Added an option to append extra metadata to the end of the description.</li>
