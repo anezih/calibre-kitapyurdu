@@ -1,407 +1,553 @@
+
+import json
 import re
 from datetime import datetime
 from queue import Empty, Queue
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urljoin
 
-import mechanize
 from calibre.ebooks.BeautifulSoup import BeautifulSoup
+from calibre.ebooks.metadata import check_isbn
 from calibre.ebooks.metadata.book.base import Metadata
 from calibre.ebooks.metadata.sources.base import Option, Source
-from calibre.utils.icu import lower, normalize, remove_accents_icu, title_case
+from calibre.utils.date import utc_tz
+from calibre.utils.icu import lower, normalize, remove_accents_icu
+from calibre.utils.localization import canonicalize_lang
 
-# ENTRIES_PER_SEARCH_RESULT_PAGE = 20
+BASE_URL = "https://www.kitapyurdu.com"
+SEARCH_URL = BASE_URL + "/index.php?route=product/search&filter_name={query}&limit={limit}"
+BOOK_URL = BASE_URL + "/kitap/-/{id}.html"
+COVER_URL = "https://img.kitapyurdu.com/v1/getImage/fn:{id}"
 
-lang_to_eng = {
-    "Türkçe"     : "Turkish",
-    "İngilizce"  : "English",
-    "İspanyolca" : "Spanish",
-    "İtalyanca"  : "Italian",
-    "Korece"     : "Korean",
-    "Rusça"      : "Russian",
-    "Almanca"    : "German",
-    "Fransızca"  : "French"
+BOOK_HREF_RE = re.compile(r"/kitap/[^/?#]*/(\d+)\.html")
+COVER_ID_RE = re.compile(r"getImage/fn:(\d+)")
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+HEADERS = [
+    ("User-Agent", USER_AGENT),
+    ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+    ("Accept-Language", "tr-TR,tr;q=0.9,en-US;q=0.7,en;q=0.5"),
+    ("Referer", BASE_URL + "/"),
+]
+
+LANG_TO_CODE = {
+    "türkçe": "tur", "ingilizce": "eng", "ispanyolca": "spa", "italyanca": "ita",
+    "korece": "kor", "rusça": "rus", "almanca": "deu", "fransızca": "fra",
+    "japonca": "jpn", "arapça": "ara", "çince": "zho", "portekizce": "por",
+    "yunanca": "ell", "farsça": "fas", "latince": "lat", "felemenkçe": "nld",
+    "hollandaca": "nld", "lehçe": "pol", "leḣçe": "pol", "bulgarca": "bul",
+    "osmanlıca": "ota", "kürtçe": "kur", "ibranice": "heb", "isveççe": "swe",
 }
 
-class KitapyurduMetadata():
-    title: str = None
-    author: list[str] = None
-    editor: str = None
-    translator: str = None
-    publisher: str = None
-    rating: int = None
-    cover_url: list = None
-    desc: str = None
-    date: datetime = None
-    original_name: str = None
-    isbn: str = None
-    lang: str = None
-    pages_num: int = None
-    tags: set[str] = None
-    url: str = None
-    _id: str = None
-    cover_id: str = None
-    source_relevance: int = None
+def tr_lower(s):
+    """Türkçe uyumlu küçük harfe çevirme (İ->i, I->ı)."""
+    return s.replace("İ", "i").replace("I", "ı").lower()
+
+
+def tr_title(s):
+    """TÜM BÜYÜK HARF gelen metni Türkçe kurallarıyla Baş Harfi Büyük yapar."""
+    out = []
+    for w in tr_lower(s).split():
+        first = w[0]
+        if first == "i":
+            first = "İ"
+        elif first == "ı":
+            first = "I"
+        else:
+            first = first.upper()
+        out.append(first + w[1:])
+    return " ".join(out)
+
+
+def clean(s):
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def text_of(el):
+    return clean(el.get_text(" ", strip=True)) if el is not None else ""
+
+
+def to_int(s):
+    digits = re.sub(r"\D", "", s or "")
+    return int(digits) if digits else None
+
+
+def book_id_from_url(url):
+    m = BOOK_HREF_RE.search(url or "")
+    if m:
+        return m.group(1)
+    m = re.search(r"(\d+)\.html", url or "")
+    return m.group(1) if m else None
+
+
+def parse_json_ld(soup):
+    """Sayfadaki JSON-LD bloklarından Product/Book nesnesini döndürür (yoksa {})."""
+    found = {}
+    for tag in soup.select('script[type="application/ld+json"]'):
+        raw = tag.string or tag.get_text() or ""
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        stack = data if isinstance(data, list) else [data]
+        while stack:
+            item = stack.pop(0)
+            if not isinstance(item, dict):
+                continue
+            if "@graph" in item and isinstance(item["@graph"], list):
+                stack.extend(item["@graph"])
+            t = item.get("@type")
+            types = t if isinstance(t, list) else [t]
+            if any(x in ("Product", "Book") for x in types):
+                found.update(item)
+    return found
+
+
+def meta_content(soup, **attrs):
+    tag = soup.find("meta", attrs=attrs)
+    return clean(tag.get("content")) if tag and tag.get("content") else ""
+
+
+class KitapyurduMetadata(object):
+    def __init__(self):
+        self.title = None
+        self.author = None
+        self.editor = None
+        self.translator = None
+        self.publisher = None
+        self.rating = None        
+        self.cover_urls = []
+        self.cover_id = None
+        self.desc = None
+        self.date = None
+        self.original_name = None
+        self.isbn = None
+        self.lang = None
+        self.pages_num = None
+        self.tags = None
+        self.url = None
+        self._id = None
+        self.source_relevance = None
 
     def extra_metadata(self):
-        res = f""
+        res = ""
         if self.editor:
-            res += f"Editör(ler): {self.editor}<br/>"
+            res += "Editör(ler): %s<br/>" % self.editor
         if self.translator:
-            res += f"Çevirmen(ler): {self.translator}<br/>"
+            res += "Çevirmen(ler): %s<br/>" % self.translator
         if self.original_name:
-            res += f"Orijinal Adı: {self.original_name}<br/>"
+            res += "Orijinal Adı: %s<br/>" % self.original_name
         if self.pages_num:
-            res += f"Sayfa Sayısı: {self.pages_num}"
-        if res:
-            res = f"<p>{res}</p>"
-        return res
+            res += "Sayfa Sayısı: %s" % self.pages_num
+        return "<p>%s</p>" % res if res else ""
 
-    def to_calibre_metadata(self, append_extra: bool = False):
-        mi = Metadata(
-            title=self.title,
-            authors=self.author
-        )
+    def to_calibre_metadata(self, append_extra=False):
+        mi = Metadata(self.title or _("Unknown"), self.author or None)
         mi.identifiers = {}
-        mi.identifiers["kitapyurdu"] = self._id
-        if self.cover_id != "0":
+        if self._id:
+            mi.identifiers["kitapyurdu"] = self._id
+        if self.cover_id and self.cover_id != "0":
             mi.identifiers["kitapyurdu_kapak"] = self.cover_id
         if self.isbn:
             mi.isbn = self.isbn
         if self.publisher:
             mi.publisher = self.publisher
-        if self.rating >= 0:
-            mi.rating = self.rating
+        if self.rating:
+            mi.rating = float(self.rating * 2)  
         if self.lang:
-            eng = lang_to_eng.get(self.lang)
-            if eng:
-                mi.language = eng
+            code = LANG_TO_CODE.get(tr_lower(self.lang)) or canonicalize_lang(self.lang)
+            if code:
+                mi.language = code
+                mi.languages = [code]
         if self.tags:
-            mi.tags = list(self.tags)
+            mi.tags = sorted(self.tags)
         if self.date:
             mi.pubdate = self.date
         if self.desc:
-            mi.comments = f"{self.desc}{self.extra_metadata() if append_extra else ''}"
+            mi.comments = self.desc + (self.extra_metadata() if append_extra else "")
+        elif append_extra and self.extra_metadata():
+            mi.comments = self.extra_metadata()
         mi.source_relevance = self.source_relevance
         return mi
 
-class KitapyurduMetadataParser():
-    def __init__(self, query, limit, logger, identifers: dict = {}) -> None:
-        self.query = query
-        self.max_results = limit
-        self.logger = logger
-        self.br = mechanize.Browser()
-        self.br.set_handle_robots(False)
-        self.br.addheaders = [
-            ('User-Agent', 'APIs-Google (+https://developers.google.com/webmasters/APIs-Google.html)'),
-        ]
-        self.ky_ident = None
-        ky_ident = identifers.get("kitapyurdu")
-        if ky_ident:
-            self.ky_ident = ky_ident
 
-    def url_content_from_query(self, query, limit):
-        quoted = quote_plus(query)
-        _url = f"https://www.kitapyurdu.com/index.php?route=product/search&filter_name={quoted}&limit={limit}"
+class KitapyurduParser(object):
+    def __init__(self, browser, log, timeout=30):
+        self.br = browser
+        self.log = log
+        self.timeout = timeout
+
+    def fetch(self, url):
         try:
-            r = self.br.open(_url)
+            r = self.br.open_novisit(url, timeout=self.timeout)
             content = r.read()
-            r.close()
-            return content
         except Exception as e:
-            self.logger.exception(f"Failed to get search results, exception: {e}\nURL was: {_url}")
-            return None
-
-    def search_urls(self, soup):
-        table = soup.select_one("#product-table")
-        if table:
-            products = table.select("div.product-cr")
-            links = [l.select_one("div.name > a") for l in products]
-            return [link["href"] for link in links]
-        else:
-            return []
-
-    def url_content(self, u):
-        try:
-            r = self.br.open(u)
-            content = r.read()
-            r.close()
-            return content
-        except Exception as e:
-            self.logger.exception(f"Failed to get page content, exception: {e}\nURL was: {u}")
-            return None
-
-    def get_search_page_urls(self, q, lim=20):
-        content = self.url_content_from_query(query=q, limit=lim)
-        if content:
-            soup = BeautifulSoup(content, "lxml")
-            urls = self.search_urls(soup)
-            if urls:
-                return urls
+            code = getattr(e, "code", None)
+            if code in (403, 429, 503):
+                self.log.error(
+                    "Kitapyurdu erişimi engelledi (HTTP %s). Site bot koruması devreye "
+                    "girmiş olabilir; bir süre bekleyip tekrar deneyin. URL: %s" % (code, url)
+                )
             else:
-                return []
-        else:
+                self.log.exception("İstek başarısız: %s (%s)" % (url, e))
+            return None
+        if not content:
+            return None
+        head = content[:4000].lower()
+        if b"just a moment" in head or b"cf-chl" in head or b"attention required" in head:
+            self.log.error("Bot koruması sayfası döndü, içerik alınamadı: %s" % url)
+            return None
+        return content
+
+    def soup(self, url):
+        content = self.fetch(url)
+        return BeautifulSoup(content, "lxml") if content else None
+
+    def search(self, query, limit=20):
+        if not query:
             return []
+        url = SEARCH_URL.format(query=quote_plus(query), limit=limit)
+        soup = self.soup(url)
+        if soup is None:
+            return []
+        links = (
+            soup.select("#product-table div.product-cr div.name > a")
+            or soup.select("div.product-cr div.name a")
+            or soup.select("div.product-cr a[href]")
+        )
+        hrefs = [a.get("href") for a in links]
+        hrefs = [h for h in hrefs if h and BOOK_HREF_RE.search(h)]
+        if not hrefs:
+            main = soup.select_one("#content") or soup
+            hrefs = [a.get("href") for a in main.select("a[href]") if BOOK_HREF_RE.search(a.get("href", ""))]
+            if hrefs:
+                self.log.info("Arama için yedek seçici kullanıldı.")
+        urls, seen = [], set()
+        for h in hrefs:
+            bid = book_id_from_url(h)
+            if bid and bid not in seen:
+                seen.add(bid)
+                urls.append(urljoin(BASE_URL, h.split("?")[0]))
+        self.log.info("'%s' için %d sonuç bulundu." % (query, len(urls)))
+        return urls
 
-    def parse_pages(self, only_ident: bool = False):
-        if only_ident:
-            u = f"https://www.kitapyurdu.com/kitap/-/{self.ky_ident}.html"
-            soups = [(BeautifulSoup(self.url_content(u), "lxml"), u)]
+    def parse_book(self, url):
+        soup = self.soup(url)
+        if soup is None:
+            return None
+        md = KitapyurduMetadata()
+        md.url = url
+        md._id = book_id_from_url(url)
+        ld = parse_json_ld(soup)
+
+        # Başlık
+        t = soup.select_one("h1.pr_header__heading") or soup.select_one("h1")
+        md.title = text_of(t) or clean(ld.get("name")) or meta_content(soup, property="og:title")
+        if not md.title:
+            self.log.error("Başlık bulunamadı, sayfa yapısı değişmiş olabilir: %s" % url)
+            return None
+
+        # Yazarlar
+        authors = [text_of(a).replace(",", "").strip()
+                   for a in soup.select("div.pr_producers__manufacturer .pr_producers__item")]
+        if not authors:
+            authors = [text_of(a) for a in soup.select("div.pr_producers__manufacturer a")]
+        if not authors:
+            ld_auth = ld.get("author")
+            if isinstance(ld_auth, dict):
+                ld_auth = [ld_auth]
+            if isinstance(ld_auth, list):
+                authors = [clean(a.get("name") if isinstance(a, dict) else str(a)) for a in ld_auth]
+            elif isinstance(ld_auth, str):
+                authors = [clean(ld_auth)]
+        if not authors:
+            scope = soup.select_one("div.pr_header") or soup.select_one("div.pr_producers") or soup
+            authors = [text_of(a) for a in scope.select('a[href*="/yazar/"]')]
+        md.author = list(dict.fromkeys(a for a in authors if a)) or None
+
+        # Yayıncı
+        pub = text_of(soup.select_one("div.pr_producers__publisher"))
+        if not pub:
+            pub = text_of(soup.select_one('a[href*="/yayinevi/"]'))
+        if not pub:
+            ld_pub = ld.get("publisher") or ld.get("brand")
+            pub = clean(ld_pub.get("name") if isinstance(ld_pub, dict) else ld_pub)
+        if pub:
+            md.publisher = tr_title(pub) if pub.isupper() else pub
+
+        # Puan (0-5)
+        stars = soup.select_one("ul.pr_rating-stars")
+        if stars is not None:
+            md.rating = len(stars.select(".icon__star-big--selected"))
         else:
-            soups = [(BeautifulSoup(self.url_content(u), "lxml"), u) for u in self.get_search_page_urls(q=self.query, lim=self.max_results) if u]
-        metadata_list = []
-        if not soups:
-            return metadata_list
-        for soup in soups:
-            metadata = KitapyurduMetadata()
-            metadata.url = soup[1]
+            agg = ld.get("aggregateRating")
+            try:
+                if isinstance(agg, dict):
+                    md.rating = int(round(float(str(agg.get("ratingValue")).replace(",", "."))))
+            except Exception:
+                pass
 
-            id_re = re.search("(\d+)\.html", metadata.url)
-            if id_re.lastindex > 0:
-                metadata._id = id_re.group(1)
+        # Kapaklar
+        cands = []
+        for el in soup.select("div.pr_images a[href], div.pr_images img"):
+            for attr in ("href", "src", "data-src", "data-original"):
+                if el.get(attr):
+                    cands.append(el.get(attr))
+        cands.append(meta_content(soup, property="og:image"))
+        img = ld.get("image")
+        if isinstance(img, list):
+            cands.extend(str(i) for i in img)
+        elif img:
+            cands.append(str(img))
+        covers = []
+        for c in cands:
+            if not c:
+                continue
+            c = re.sub(r"/wh:.*$", "", urljoin(BASE_URL, c))  
+            if "getImage" in c and c not in covers:
+                covers.append(c)
+        md.cover_urls = covers
+        for c in covers:
+            m = COVER_ID_RE.search(c)
+            if m:
+                md.cover_id = m.group(1)
+                break
 
-            title = soup[0].select_one("h1.pr_header__heading")
-            if title:
-                metadata.title = title.getText()
+        # Açıklama
+        d = soup.select_one("span.info__text") or soup.select_one("div.info__text")
+        if d is not None:
+            md.desc = str(d)
+        else:
+            plain = clean(ld.get("description")) or meta_content(soup, property="og:description")
+            if plain:
+                md.desc = "<p>%s</p>" % plain
 
-            author = soup[0].select("div.pr_producers__manufacturer > div.pr_producers__item")
-            if author:
-                metadata.author = [a.getText().replace(",","").strip() for a in author]
+        # Özellik tablosu (Yayın Tarihi, ISBN, Dil...)
+        attrs = {}
+        rows = soup.select("div.attributes tr") or soup.select("tr")
+        for tr in rows:
+            tds = tr.find_all("td")
+            if len(tds) >= 2:
+                key = tr_lower(text_of(tds[0])).rstrip(":").strip()
+                val = text_of(tds[1])
+                if key and val:
+                    attrs[key] = attrs[key] + ", " + val if key in attrs else val
+        if not attrs:
+            body = soup.get_text("\n", strip=True)
+            for key in ("ISBN", "Dil", "Sayfa Sayısı", "Yayın Tarihi", "Çevirmen", "Orijinal Adı", "Editör"):
+                m = re.search(re.escape(key) + r":?\s*\n?\s*([^\n]+)", body)
+                if m:
+                    attrs[tr_lower(key)] = clean(m.group(1))
 
-            publisher = soup[0].select_one("div.pr_producers__publisher")
-            if publisher:
-                # all_caps = publisher.getText().strip()
-                # all_caps = all_caps.replace("I","ı").replace("İ", "i")
-                metadata.publisher = title_case(publisher.getText().strip())
+        def attr(*names):
+            for n in names:
+                v = attrs.get(tr_lower(n))
+                if v:
+                    return v
+            return None
 
-            rating_ul = soup[0].select_one("ul.pr_rating-stars")
-            if rating_ul:
-                rating = len(rating_ul.select(".icon__star-big--selected"))
-                metadata.rating = rating
+        md.editor = attr("Editör", "Editor")
+        md.translator = attr("Çevirmen")
+        md.original_name = attr("Orijinal Adı")
+        md.lang = attr("Dil")
+        md.pages_num = to_int(attr("Sayfa Sayısı"))
 
-            cover_url_with_res = soup[0].select_one("div.pr_images")
-            if cover_url_with_res:
-                multi = cover_url_with_res.select_one("ul.pr_images__thumb-list")
-                if multi:
-                    metadata.cover_url = [(x := a["href"])[:x.index("wh") - 1] for a in multi.find_all("a")]
-                else:
-                    jbox = cover_url_with_res.select_one("a.js-jbox-book-cover")["href"]
-                    cover_url = jbox[:jbox.index("wh") - 1]
-                    metadata.cover_url = [cover_url]
+        raw_date = attr("Yayın Tarihi")
+        if raw_date:
+            for fmt in ("%d.%m.%Y", "%m.%Y", "%Y"):
+                try:
+                    md.date = datetime.strptime(raw_date.strip(), fmt).replace(tzinfo=utc_tz)
+                    break
+                except ValueError:
+                    continue
 
-            if metadata.cover_url:
-                metadata.cover_id = metadata.cover_url[0].split(":")[-1]
+        raw_isbn = attr("ISBN") or clean(ld.get("isbn") or ld.get("gtin13"))
+        if raw_isbn:
+            md.isbn = check_isbn(raw_isbn)
 
-            desc = soup[0].select_one("span.info__text")
-            if desc:
-                metadata.desc = str(desc)
-
-            attrs_table = {}
-            table = soup[0].select_one("div.attributes").find_all("tr")
-            tds = [td for t in table for td in t.find_all("td")]
-            for td in range(len(tds)):
-                if td % 2 == 1:
-                    key = tds[td-1].getText().strip()
-                    val = tds[td].getText()
-                    if key not in attrs_table.keys():
-                        attrs_table[key] = val
-                    else:
-                        attrs_table[key] += f", {val}"
-
-            editors = attrs_table.get("Editor:")
-            if editors:
-                metadata.editor = editors.strip()
-
-            translators = attrs_table.get("Çevirmen:")
-            if translators:
-                metadata.translator = translators.strip()
-
-            date = attrs_table.get("Yayın Tarihi:")
-            if date:
-                metadata.date = datetime.strptime(date, "%d.%m.%Y")
-
-            original_name = attrs_table.get("Orijinal Adı:")
-            if original_name:
-                metadata.original_name = original_name
-
-            isbn = attrs_table.get("ISBN:")
-            if isbn:
-                metadata.isbn = isbn
-
-            lang = attrs_table.get("Dil:")
-            if lang:
-                # lang = lang.replace("I","ı").replace("İ", "i")
-                metadata.lang = title_case(lang)
-
-            pages_num = attrs_table.get("Sayfa Sayısı:")
-            if pages_num:
-                metadata.pages_num = int(pages_num)
-
-            tags_ul = soup[0].select_one("ul.rel-cats__list")
-            tags = {}
-            if tags_ul:
-                tags = {t.getText() for t in tags_ul.find_all("span")}
-            if tags:
-                if "Kitap" in tags:
-                    tags.remove("Kitap")
-                if "Diğer" in tags:
-                    tags.remove("Diğer")
-                metadata.tags = tags
-            metadata_list.append(metadata)
-        return metadata_list
+        # Etiketler
+        tags = {text_of(s) for s in soup.select("ul.rel-cats__list span")}
+        if not tags:
+            tags = {text_of(a) for a in soup.select("ul.rel-cats__list a")}
+        tags.discard("")
+        tags -= {"Kitap", "Diğer"}
+        md.tags = tags or None
+        return md
 
 class Kitapyurdu(Source):
-    name                    = "Kitapyurdu"
-    author                  = "Nezih <https://github.com/anezih>"
-    description             = _("Downloads metadata and covers from kitapyurdu.com")
-    version                 = (1, 1, 1)
+    name = "Kitapyurdu"
+    author = "Nezih <https://github.com/anezih> (1.2.0 düzeltmeleri)"
+    description = _("Downloads metadata and covers from kitapyurdu.com")
+    version = (1, 2, 0)
     minimum_calibre_version = (6, 10, 0)
-    supported_platforms     = ["windows", "osx", "linux"]
-    capabilities            = frozenset(["identify", "cover"])
-    touched_fields          = frozenset(
-        [
-            "title", "authors", "tags", "publisher", "comments", "pubdate",
-            "rating", "identifier:isbn", "language", "identifier:kitapyurdu"
-        ]
-    )
+    supported_platforms = ["windows", "osx", "linux"]
+    capabilities = frozenset(["identify", "cover"])
+    touched_fields = frozenset([
+        "title", "authors", "tags", "publisher", "comments", "pubdate",
+        "rating", "identifier:isbn", "language", "identifier:kitapyurdu",
+    ])
     supports_gzip_transfer_encoding = True
     cached_cover_url_is_reliable = True
     has_html_comments = True
     prefer_results_with_isbn = False
-    can_get_multiple_covers = True
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.max_res = self.prefs.get("entries_per_search_result_page")
-        self.append_extra = self.prefs.get("append_extra_metadata_to_desc")
+    can_get_multiple_covers = False
 
     options = (
-        Option (
-            "entries_per_search_result_page",
-            "choices",
-            20,
+        Option(
+            "entries_per_search_result_page", "choices", 10,
             _("Max. number of search results."),
-            _("Select max. number of search results. (50 may cause timeout errors.)"),
-            {20:"20", 25:"25", 50:"50"}
+            _("Select max. number of search results to fetch. More results = slower, "
+              "and a higher chance of being rate-limited by the site."),
+            {5: "5", 10: "10", 20: "20", 25: "25"},
         ),
-        Option (
-            "append_extra_metadata_to_desc",
-            "bool",
-            False,
+        Option(
+            "append_extra_metadata_to_desc", "bool", False,
             _("Append extra metadata to the end of the description."),
-            _("Extra metadata: Editor(s), translator(s), original name, page number.")
+            _("Extra metadata: Editor(s), translator(s), original name, page number."),
         ),
     )
+    def make_browser(self):
+        br = self.browser
+        try:
+            br.set_handle_robots(False)
+        except Exception:
+            pass
+        br.addheaders = list(HEADERS)
+        return br
 
     def get_book_url_name(self, idtype, idval, url):
         return "Kitapyurdu"
 
     def get_book_url(self, identifiers):
-        kitapyurdu_id = identifiers.get("kitapyurdu")
-        if kitapyurdu_id:
-            url = f"https://www.kitapyurdu.com/kitap/-/{kitapyurdu_id}.html"
-            return ("kitapyurdu", kitapyurdu_id, url)
-        else:
+        ky_id = identifiers.get("kitapyurdu")
+        if ky_id:
+            return ("kitapyurdu", ky_id, BOOK_URL.format(id=ky_id))
+        return None
+
+    def id_from_url(self, url):
+        m = re.search(r"kitapyurdu\.com/kitap/[^/]*/(\d+)\.html", url or "")
+        return ("kitapyurdu", m.group(1)) if m else None
+
+    def build_query(self, log, title=None, authors=None, only_title=False,
+                    rm_accents=False, ss=False, sj=True):
+        if not (title or authors):
             return None
-
-    def build_query(self, log, title=None, authors=None, only_title=False, rm_accents=False, ss=False, sj=True):
-        title_tokens = []
+        title_tokens = list(self.get_title_tokens(title=title, strip_subtitle=ss, strip_joiners=sj))
         author_tokens = []
-        if title or authors:
-            title_tokens = list(self.get_title_tokens(title=title, strip_subtitle=ss, strip_joiners=sj))
-            if not only_title:
-                author_tokens = list(self.get_author_tokens(authors=authors, only_first_author=True))
-            all = lower(" ".join(title_tokens + author_tokens))
-            all = normalize(all)
-            if rm_accents:
-                all = remove_accents_icu(all)
-                log.info(f"Removed accents from query.")
-            if all:
-                log.info(f"Constructed query: {all}")
-                return all
-            else:
-                return None
+        if not only_title:
+            author_tokens = list(self.get_author_tokens(authors=authors, only_first_author=True))
+        q = normalize(lower(" ".join(title_tokens + author_tokens)))
+        if rm_accents:
+            q = remove_accents_icu(q)
+        q = q.strip()
+        if q:
+            log.info("Constructed query: %s" % q)
+            return q
+        return None
 
-    def create_metadata_list(self, log, title=None, authors=None, identifiers={}):
-        metadata_list: list[KitapyurduMetadata] = []
-        ky_ident = identifiers.get("kitapyurdu")
-        if ky_ident:
-            ky_metadata_obj = KitapyurduMetadataParser(query=None, identifers=identifiers, limit=self.max_res, logger=log)
-            metadata_list = ky_metadata_obj.parse_pages(only_ident=True)
-            if metadata_list:
-                log.info(f"{'-'*30}\nMatched kitapyurdu id.")
-                return metadata_list
-        title_authors = self.build_query(log=log, title=title, authors=authors)
-        ky_metadata_obj = KitapyurduMetadataParser(query=title_authors, limit=self.max_res, logger=log)
-        metadata_list = ky_metadata_obj.parse_pages()
-        if metadata_list:
-            return metadata_list
-        else:
-            log.info(f"Build query second pass: only_title, strip_subtitle, rm_accents")
-            title_authors = self.build_query(log=log, title=title, authors=authors, only_title=True, rm_accents=True, ss=True)
-            ky_metadata_obj = KitapyurduMetadataParser(query=title_authors, limit=self.max_res, logger=log)
-            metadata_list = ky_metadata_obj.parse_pages()
-            if metadata_list:
-                return metadata_list
-            else:
-                return None
+    # ---- identify ---------------------------------------------------------
+    def identify(self, log, result_queue, abort, title=None, authors=None,
+                 identifiers=None, timeout=30):
+        identifiers = identifiers or {}
+        max_res = int(self.prefs.get("entries_per_search_result_page") or 10)
+        append_extra = bool(self.prefs.get("append_extra_metadata_to_desc"))
+        parser = KitapyurduParser(self.make_browser(), log, timeout)
 
-    def identify(self, log, result_queue, abort, title=None, authors=None, identifiers={}, timeout=30):
-        if abort.is_set():
+        results, seen = [], set()
+
+        def add(md):
+            if md and md._id not in seen:
+                seen.add(md._id)
+                results.append(md)
+
+        ky_id = identifiers.get("kitapyurdu")
+        if ky_id:
+            add(parser.parse_book(BOOK_URL.format(id=ky_id)))
+            if results:
+                log.info("Matched kitapyurdu id.")
+
+        if not results:
+            queries = []
+            isbn = check_isbn(identifiers.get("isbn"))
+            if isbn:
+                queries.append(isbn)
+            queries.append(self.build_query(log, title=title, authors=authors))
+            queries.append(self.build_query(log, title=title, authors=authors, only_title=True))
+            queries.append(self.build_query(log, title=title, authors=authors, only_title=True,
+                                            rm_accents=True, ss=True))
+            tried = set()
+            for q in queries:
+                if abort.is_set():
+                    return
+                if not q or q in tried:
+                    continue
+                tried.add(q)
+                for url in parser.search(q, limit=20)[:max_res]:
+                    if abort.is_set():
+                        return
+                    try:
+                        add(parser.parse_book(url))
+                    except Exception:
+                        log.exception("Sayfa ayrıştırılamadı: %s" % url)
+                if results:
+                    break
+
+        if not results:
+            log.info("Kitapyurdu'nda sonuç bulunamadı.")
             return
-        metadata_list = self.create_metadata_list(log=log, title=title, authors=authors, identifiers=identifiers)
-        if not metadata_list:
-            return
-        if metadata_list:
-            for relevance, mi in enumerate(metadata_list, start=1):
-                mi.source_relevance = relevance
-                result_queue.put(mi.to_calibre_metadata(self.append_extra))
+
+        for relevance, md in enumerate(results, start=1):
+            md.source_relevance = relevance
+            mi = md.to_calibre_metadata(append_extra)
+            if md.cover_urls and md._id:
+                self.cache_identifier_to_cover_url(md._id, md.cover_urls[0])
+            if md.isbn and md._id:
+                self.cache_isbn_to_identifier(md.isbn, md._id)
+            result_queue.put(mi)
 
     def get_cached_cover_url(self, identifiers):
-        _id = identifiers.get('kitapyurdu_kapak')
-        if _id:
-            return f"https://img.kitapyurdu.com/v1/getImage/fn:{_id}"
-        else:
-            return None
+        identifiers = identifiers or {}
+        cover_id = identifiers.get("kitapyurdu_kapak")
+        if cover_id and cover_id != "0":
+            return COVER_URL.format(id=cover_id)
+        ky_id = identifiers.get("kitapyurdu")
+        if ky_id:
+            return self.cached_identifier_to_cover_url(ky_id)
+        return None
 
-    def download_cover(self, log, result_queue, abort, title=None, authors=None, identifiers=None, timeout=30, get_best_cover=False):
+    def download_cover(self, log, result_queue, abort, title=None, authors=None,
+                       identifiers=None, timeout=30, get_best_cover=False):
+        identifiers = identifiers or {}
         if abort.is_set():
             return
-        cached = self.get_cached_cover_url(identifiers=identifiers)
-        if cached:
-            try:
-                cover_data = self.browser.open_novisit(cached, timeout=timeout).read()
-                if cover_data:
-                    result_queue.put((self, cover_data))
-            except:
-                log.exception(f"Failed to get covers from: {cached}")
-        else:
+        url = self.get_cached_cover_url(identifiers)
+        if not url:
             log.info("Could not find cached URL for covers, running identify...")
-            cached_from_ident = ""
             queue = Queue()
-            self.identify(log, result_queue=queue, abort=abort, title=title, authors=authors, identifiers=identifiers, timeout=30)
+            self.identify(log, queue, abort, title=title, authors=authors,
+                          identifiers=identifiers, timeout=timeout)
             if abort.is_set():
                 return
-            res = []
+            found = []
             while True:
                 try:
-                    res.append(queue.get_nowait())
+                    found.append(queue.get_nowait())
                 except Empty:
                     break
-            res.sort(
-                key=self.identify_results_keygen(
-                    title=title,
-                    authors=authors,
-                    identifiers=identifiers
-                )
-            )
-            for mi in res:
-                cached = self.get_cached_cover_url(mi.identifiers)
-                if cached:
-                    cached_from_ident = cached
+            found.sort(key=self.identify_results_keygen(
+                title=title, authors=authors, identifiers=identifiers))
+            for mi in found:
+                url = self.get_cached_cover_url(mi.identifiers)
+                if url:
                     break
-            try:
-                cover_data = self.browser.open_novisit(cached_from_ident, timeout=timeout).read()
-                if cover_data:
-                    result_queue.put((self, cover_data))
-            except:
-                log.exception(f"Failed to get covers from: {cached}")
+        if not url:
+            log.info("Kitapyurdu'nda kapak bulunamadı.")
+            return
+        try:
+            data = self.make_browser().open_novisit(url, timeout=timeout).read()
+            if data:
+                result_queue.put((self, data))
+        except Exception:
+            log.exception("Failed to get covers from: %s" % url)
